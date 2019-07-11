@@ -1,0 +1,82 @@
+Tuto from : https://docs.portworx.com/interactive-tutorials/
+
+# create dedicated namespace
+k create ns px-kafka-zookeeper
+
+# Check portworx pod deployed in ds
+kubectl get pods -n kube-system -l name=portworx -o wide
+
+# check sc
+k get sc portworx-sc
+kubectl -n px-kafka-zookeeper create -f px-ha-sc.yaml
+
+# create Zk configmap and statefulset
+kubectl -n px-kafka-zookeeper create -f zk-config.yaml
+kubectl -n px-kafka-zookeeper create -f zk-ss.yaml
+
+watch kubectl -n px-kafka-zookeeper get pods
+
+
+# Verify that the Zookeeper ensemble is working by creating and getting a /foo topic
+kubectl -n px-kafka-zookeeper exec zk-0 -- /opt/zookeeper/bin/zkCli.sh create /foo bar
+kubectl -n px-kafka-zookeeper exec zk-2 -- /opt/zookeeper/bin/zkCli.sh get /foo
+
+# Create configmap and service
+kubectl -n px-kafka-zookeeper create -f kafka-config.yaml
+
+# Create statefulset
+# edit default zookeeper endpoint with namespace px-kafka-zookeeper
+kubectl -n px-kafka-zookeeper create -f kafka-ss.yaml
+kubectl -n px-kafka-zookeeper create -f kafka-cli.yaml
+k -n px-kafka-zookeeper logs kafka-0
+watch kubectl -n px-kafka-zookeeper get pods
+
+# Fun with kafka - Create a topic and send + receive messages on it
+kubectl -n px-kafka-zookeeper exec -it kafka-cli bash
+./bin/kafka-topics.sh --create --zookeeper zk-headless:2181 --replication-factor 1 --partitions 1 --topic test
+./bin/kafka-console-producer.sh --broker-list kafka-broker:9092 --topic test
+This is a message
+This is another message
+Last message
+
+./bin/kafka-console-consumer.sh --bootstrap-server kafka-broker:9092 --topic test --partition 0 --from-beginning
+
+# Simulate a node failure
+NODE=`kubectl -n px-kafka-zookeeper get pods -o wide | grep kafka-0 | awk '{print $7}'`
+kubectl cordon ${NODE}
+
+# Delete kafka pod and verify it new placement
+kubectl -n px-kafka-zookeeper delete pod kafka-0
+
+# Check pod replacement
+watch kubectl -n px-kafka-zookeeper get pods kafka-0 -o wide
+
+# Uncordon the node (as pod has moved)
+kubectl uncordon ${NODE}
+
+# check db still contains data
+kubectl -n px-kafka-zookeeper exec -it kafka-cli bash
+./bin/kafka-console-consumer.sh --bootstrap-server kafka-broker:9092 --topic test --partition 0 --from-beginning
+
+# Scale replicaset to 3 and see that new volume a auto created
+kubectl -n px-kafka-zookeeper scale sts kafka --replicas=3
+watch kubectl -n px-kafka-zookeeper get pods
+
+# Inspect the new volume
+VOL=`kubectl get pvc -n px-kafka-zookeeper | grep kafka | awk '{print $3}'`
+PX_POD=$(kubectl get pods -l name=portworx -n kube-system -o jsonpath='{.items[0].metadata.name}')
+kubectl exec -it $PX_POD -n kube-system -- /opt/pwx/bin/pxctl volume inspect ${VOL}
+
+
+
+------------------------------------
+# DNS debug
+kubectl -n px-kafka-zookeeper apply -f busybox.yaml
+kubectl -n px-kafka-zookeeper exec -ti busybox -- cat /etc/resolv.conf
+kubectl -n px-kafka-zookeeper exec -ti busybox -- nslookup kubernetes.default
+
+--- dns edit config map
+k edit configmap coredns -n kube-system
+kubectl get pods -n kube-system -oname |grep coredns |xargs kubectl delete -n kube-system
+watch kubectl get pods -n kube-system 
+
